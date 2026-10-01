@@ -2,6 +2,7 @@
 
 import base64
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -13,7 +14,11 @@ class WordPressClient:
 
     def __init__(self, config: Config):
         self.config = config
-        self._client = httpx.Client(timeout=30.0)
+        # Hostinger/LiteSpeed returns 403 for the default python-httpx user agent.
+        self._client = httpx.Client(
+            timeout=30.0,
+            headers={"User-Agent": "WordPressMCP/1.0"},
+        )
 
     def _get_headers(self, require_auth: bool = False) -> dict[str, str]:
         """Get request headers with optional authentication."""
@@ -22,7 +27,11 @@ class WordPressClient:
         if self.config.has_auth:
             credentials = f"{self.config.user}:{self.config.app_password}"
             encoded = base64.b64encode(credentials.encode()).decode()
-            headers["Authorization"] = f"Basic {encoded}"
+            basic = f"Basic {encoded}"
+            headers["Authorization"] = basic
+            headers["X-WP-Application"] = basic
+            # LiteSpeed drops Authorization before PHP. wp-config.php reads this cookie instead.
+            headers["Cookie"] = "wp_app=" + quote(encoded, safe="")
         elif require_auth:
             raise ValueError("Authentication required but not configured")
 
@@ -164,11 +173,23 @@ class WordPressClient:
 
     def get_site_info(self) -> dict:
         """Get site information."""
-        # Use the root endpoint for site info
+        # Use the root endpoint for site info. Some hosts disable that index.
         url = f"{self.config.url.rstrip('/')}/wp-json"
         headers = self._get_headers()
 
         response = self._client.get(url, headers=headers)
+        if response.status_code == 403 and self.config.has_auth:
+            settings = self._get("settings", require_auth=True)
+            site_url = settings.get("url", self.config.url)
+            return {
+                "name": settings.get("title", ""),
+                "description": settings.get("description", ""),
+                "url": site_url,
+                "home": site_url,
+                "gmt_offset": settings.get("gmt_offset", 0),
+                "timezone_string": settings.get("timezone", ""),
+            }
+
         response.raise_for_status()
         data = response.json()
 
